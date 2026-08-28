@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import os
+import re
 import secrets
 import string
 import time
@@ -29,6 +30,38 @@ load_dotenv(override=True)
 log = logging_setup.setup_logging("web")
 browser_log = logging_setup.attach_file("browser", "browser.log")
 usage_log = logging_setup.attach_file("usage", "usage.log")
+
+
+def _load_htaccess_env() -> list[str]:
+		"""Fill missing env vars from the SetEnv lines in .htaccess.
+
+		cPanel/CloudLinux stores credentials there, but SetEnv only reaches the
+		web server: a worker started from SSH or cron inherits none of them and
+		cannot register with LiveKit. Real environment variables and .env always
+		win - this only fills in what is still missing.
+		"""
+		filled = []
+		path = Path(__file__).resolve().parent / ".htaccess"
+		try:
+				if not path.exists():
+						return filled
+				for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+						match = re.match(r"^\s*SetEnv\s+(\S+)\s+(.*?)\s*$", line)
+						if not match:
+								continue
+						name = match.group(1)
+						value = match.group(2).strip().strip("\"'")
+						if value and not os.getenv(name):
+								os.environ[name] = value
+								filled.append(name)
+		except Exception:
+				log.exception("could not read env vars from %s", path)
+		return filled
+
+
+_htaccess_vars = _load_htaccess_env()
+if _htaccess_vars:
+		log.info("loaded %d env var(s) from .htaccess SetEnv: %s", len(_htaccess_vars), ", ".join(_htaccess_vars))
 
 MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1-mini")
 VOICE = os.getenv("OPENAI_REALTIME_VOICE", "shimmer")

@@ -6,7 +6,9 @@
 set -u
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON="/home/movenetics/virtualenv/public_html/call.moveneticsdigital.com/3.12/bin/python"
+export APP_DIR
+# Override for local testing: PYTHON=/path/to/python ./check_agent.sh
+PYTHON="${PYTHON:-/home/movenetics/virtualenv/public_html/call.moveneticsdigital.com/3.12/bin/python}"
 cd "$APP_DIR" || exit 1
 
 hr() { printf '\n== %s ==\n' "$1"; }
@@ -41,33 +43,34 @@ except Exception as exc:
     print(f"  FAIL  silero VAD unavailable -> {exc}")
 PY
 
-hr "credentials this process can see"
-"$PYTHON" - <<'PY'
+hr "credentials the worker will see"
+# Imports app.py so this reports exactly what agent.py resolves at startup:
+# real env vars first, then .env, then the SetEnv lines in .htaccess.
+"$PYTHON" - <<'PYEOF'
 import os
 import sys
-sys.path.insert(0, ".")
+sys.path.insert(0, os.environ.get("APP_DIR", "."))
 try:
-    from dotenv import load_dotenv
-    # Explicit path: find_dotenv() asserts when python reads the script from stdin.
-    loaded = load_dotenv(".env", override=True)
-    print(f"  {'OK   ' if loaded else 'FAIL '} .env file: {'loaded' if loaded else 'NOT PRESENT'}")
+    import app  # noqa: F401  (loads .env and .htaccess exactly as the worker does)
 except Exception as exc:
-    print(f"  FAIL  could not load .env -> {exc!r}")
+    print(f"  FAIL  app.py failed to import -> {exc!r}")
+    raise SystemExit(1)
 
 required = ["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "OPENAI_API_KEY"]
 missing = []
 for name in required:
     value = os.getenv(name)
-    print(f"  {'OK   ' if value else 'FAIL '} {name}: {'set' if value else 'MISSING'}")
+    shown = value if (name == "LIVEKIT_URL" and value) else ("set" if value else "MISSING")
+    print(f"  {'OK   ' if value else 'FAIL '} {name}: {shown}")
     if not value:
         missing.append(name)
 
 if missing:
     print()
     print("  -> The worker cannot register with LiveKit without these.")
-    print("     SetEnv in .htaccess only reaches the web server, never this process.")
-    print("     Create a .env file here (see .env.example) with the same values.")
-PY
+    print("     Add them as SetEnv lines in .htaccess via the cPanel env var UI,")
+    print("     or create a .env file here - see .env.example.")
+PYEOF
 
 hr "worker process"
 if pgrep -af "agent\.py start" 2>/dev/null; then
