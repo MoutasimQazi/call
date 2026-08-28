@@ -2,8 +2,10 @@ openai>=2.6.1
 flask>=3.0
 python-dotenv>=1.0
 livekit-api>=1.0.0
-livekit-agents>=1.0.0
+# 1.2+ ships livekit.agents.inference (LiveKit-hosted STT/TTS, no vendor key).
+livekit-agents>=1.7.0
 livekit-plugins-openai>=1.0.0
-livekit-plugins-elevenlabs>=1.0.0
+# Voice activity detection: required for the STT -> LLM -> TTS pipeline.
+livekit-plugins-silero>=1.0.0
 sounddevice>=0.5
 numpy>=2.0

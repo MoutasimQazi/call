@@ -280,8 +280,9 @@ def install_asyncio_logging(loop=None) -> None:
 def environment_report() -> dict:
     """Which credentials/settings this process actually sees (values masked)."""
     watched = [
-        "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "ELEVENLABS_API_KEY",
-        "ELEVENLABS_VOICE_ID", "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
+        "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL",
+        "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
+        "LIVEKIT_STT_MODEL", "LIVEKIT_TTS_MODEL", "LIVEKIT_TTS_VOICE",
         "OPENAI_REALTIME_MODEL", "OPENAI_REALTIME_VOICE", "RESTAURANT_NAME",
         "LOG_LEVEL", "LOG_DIR",
     ]

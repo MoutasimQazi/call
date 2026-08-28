@@ -33,7 +33,11 @@ usage_log = logging_setup.attach_file("usage", "usage.log")
 MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1-mini")
 VOICE = os.getenv("OPENAI_REALTIME_VOICE", "shimmer")
 TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", VOICE)
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "iP95p4xoKVk53GoZ742B")
+# Speech for the LiveKit pipeline models comes from LiveKit Inference, which
+# bills against the LiveKit Cloud project - no separate speech vendor key.
+LIVEKIT_STT_MODEL = os.getenv("LIVEKIT_STT_MODEL", "deepgram/nova-3")
+LIVEKIT_TTS_MODEL = os.getenv("LIVEKIT_TTS_MODEL", "cartesia/sonic-3")
+LIVEKIT_TTS_VOICE = os.getenv("LIVEKIT_TTS_VOICE", "")
 RESTAURANT = os.getenv("RESTAURANT_NAME", "Frush")
 
 MODEL_OPTIONS = {
@@ -868,7 +872,7 @@ INDEX_HTML = """<!DOCTYPE html>
 			voiceSel.disabled = realtime ? active : true;
 			modelNote.textContent = realtime
 				? "Voice calls use OpenAI Realtime WebRTC."
-				: "Fixed ElevenLabs voice delivered through LiveKit.";
+				: "Speech-to-speech pipeline with LiveKit-hosted voice.";
 		}
 
 		modelSel.addEventListener("change", updateModelNote);

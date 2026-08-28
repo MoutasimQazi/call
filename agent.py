@@ -1,4 +1,9 @@
-"""LiveKit voice worker for Frush ordering calls."""
+"""LiveKit voice worker for Frush ordering calls.
+
+Speech for the non-realtime models is served by LiveKit Inference, so this
+worker needs no third-party speech vendor key -- it authenticates with the same
+LIVEKIT_* credentials it already uses to register.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +13,7 @@ import time
 
 from livekit import agents
 from livekit.agents import Agent, AgentSession, JobContext, function_tool
-from livekit.plugins import elevenlabs, openai
+from livekit.plugins import openai
 
 import logging_setup
 
@@ -16,9 +21,28 @@ log = logging_setup.setup_logging("agent")
 
 import app
 
+try:  # LiveKit Inference: hosted STT/TTS billed to the LiveKit Cloud project.
+    from livekit.agents import inference
+except ImportError:  # livekit-agents older than 1.2
+    inference = None
+
+try:
+    from livekit.plugins import silero
+except ImportError:
+    silero = None
+
 
 DEFAULT_MODEL = "gpt-4o-mini"
 MODEL_PREFIX = "frush-"
+
+
+def agents_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("livekit-agents")
+    except Exception:
+        return "unknown"
 
 
 def model_key_from_room(room_name: str) -> str:
@@ -60,6 +84,55 @@ def make_llm(model_key: str):
         raise RuntimeError("OPENAI_API_KEY is not configured on the server")
     log.debug("using openai.LLM(model=%s)", config["api_model"])
     return openai.LLM(model=config["api_model"])
+
+
+def make_audio() -> dict:
+    """STT + TTS for the pipeline models, from LiveKit Inference."""
+    if inference is not None:
+        tts_kwargs = {"model": app.LIVEKIT_TTS_MODEL}
+        if app.LIVEKIT_TTS_VOICE:
+            tts_kwargs["voice"] = app.LIVEKIT_TTS_VOICE
+        log.info(
+            "[AUDIO] LiveKit Inference: stt=%s tts=%s voice=%s",
+            app.LIVEKIT_STT_MODEL, app.LIVEKIT_TTS_MODEL, app.LIVEKIT_TTS_VOICE or "<provider default>",
+        )
+        return {
+            "stt": inference.STT(model=app.LIVEKIT_STT_MODEL),
+            "tts": inference.TTS(**tts_kwargs),
+        }
+
+    log.warning(
+        "[AUDIO] livekit.agents.inference is not available in livekit-agents %s - "
+        "falling back to the OpenAI speech plugins. Upgrade with: pip install -U 'livekit-agents>=1.7'",
+        agents_version(),
+    )
+    if not os.getenv("OPENAI_API_KEY"):
+        log.error("OPENAI_API_KEY missing - no speech backend is available")
+        raise RuntimeError("No speech backend available: install livekit-agents>=1.2 or set OPENAI_API_KEY")
+    return {"stt": openai.STT(), "tts": openai.TTS(voice=app.TTS_VOICE)}
+
+
+def load_vad():
+    """Silero VAD segments the caller's speech for the STT pipeline."""
+    if silero is None:
+        log.error(
+            "[AUDIO] livekit-plugins-silero is not installed - the agent cannot tell when the "
+            "caller stops speaking. Install it with: pip install livekit-plugins-silero"
+        )
+        return None
+    started = time.monotonic()
+    vad = silero.VAD.load()
+    log.info("[AUDIO] Silero VAD loaded (%.0f ms)", (time.monotonic() - started) * 1000)
+    return vad
+
+
+def prewarm(proc) -> None:
+    """Load the VAD model once per worker process, not once per call."""
+    log.info("[WORKER] prewarming process %s", getattr(proc, "pid", "?"))
+    try:
+        proc.userdata["vad"] = load_vad()
+    except Exception:
+        log.exception("[WORKER] prewarm failed - VAD will be loaded per job instead")
 
 
 class FoodOrderingAgent(Agent):
@@ -213,27 +286,26 @@ async def entrypoint(ctx: JobContext) -> None:
         config = app.MODEL_OPTIONS[model_key]
         session_kwargs = {"llm": make_llm(model_key)}
         if model_key != "realtime-mini-2.1":
-            if not os.getenv("ELEVENLABS_API_KEY"):
-                log.error("ELEVENLABS_API_KEY missing - TTS cannot start for model %s", model_key)
-                raise RuntimeError("ELEVENLABS_API_KEY is not configured on the server")
-            log.info(
-                "[JOB] pipeline mode: STT=openai.STT TTS=elevenlabs(voice=%s, model=eleven_flash_v2_5)",
-                app.ELEVENLABS_VOICE_ID,
-            )
-            session_kwargs.update({
-                "stt": openai.STT(),
-                "tts": elevenlabs.TTS(
-                    voice_id=app.ELEVENLABS_VOICE_ID,
-                    model="eleven_flash_v2_5",
-                ),
-            })
+            session_kwargs.update(make_audio())
+            vad = None
+            try:
+                vad = ctx.proc.userdata.get("vad")
+            except Exception:
+                log.debug("[JOB] no prewarmed userdata on this context")
+            if vad is None:
+                vad = load_vad()
+            if vad is not None:
+                session_kwargs["vad"] = vad
         else:
             log.info("[JOB] realtime mode: speech handled end-to-end by %s", config["api_model"])
 
         session = AgentSession(**session_kwargs)
         _attach_session_logging(session, room_name)
 
-        log.info("[JOB] starting session for room=%s model=%s", room_name, model_key)
+        log.info(
+            "[JOB] starting session room=%s model=%s components=%s",
+            room_name, model_key, sorted(session_kwargs),
+        )
         await session.start(room=ctx.room, agent=FoodOrderingAgent())
         log.info("[JOB] session started (%.0f ms since entry)", (time.monotonic() - started) * 1000)
 
@@ -247,13 +319,20 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 if __name__ == "__main__":
-    log.info("[WORKER] starting LiveKit worker")
+    log.info("[WORKER] starting LiveKit worker (livekit-agents %s)", agents_version())
     log.info("[WORKER] environment: %s", logging_setup.dumps(logging_setup.environment_report(), safe=True))
+    log.info(
+        "[WORKER] speech backend: %s",
+        "LiveKit Inference" if inference is not None else "OpenAI plugins (inference unavailable)",
+    )
+    if silero is None:
+        log.warning("[WORKER] livekit-plugins-silero is missing - install it before taking calls")
     if not os.getenv("LIVEKIT_URL"):
         log.error("[WORKER] LIVEKIT_URL is not set - the worker cannot register")
     agents.cli.run_app(
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
             ws_url=os.getenv("LIVEKIT_URL"),
             api_key=os.getenv("LIVEKIT_API_KEY"),
             api_secret=os.getenv("LIVEKIT_API_SECRET"),
