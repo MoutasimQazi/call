@@ -6,5 +6,5 @@ logs/*.log
 logs/*.log.*
 logs/*.jsonl
 logs/*.jsonl.*
-
+.htaccess
 .env
