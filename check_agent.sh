@@ -46,7 +46,8 @@ PY
 hr "credentials the worker will see"
 # Imports app.py so this reports exactly what agent.py resolves at startup:
 # real env vars first, then .env, then the SetEnv lines in .htaccess.
-"$PYTHON" - <<'PYEOF'
+# LOG_CONSOLE=0 keeps app.py's startup banner out of this report.
+LOG_CONSOLE=0 "$PYTHON" - <<'PYEOF'
 import os
 import sys
 sys.path.insert(0, os.environ.get("APP_DIR", "."))
