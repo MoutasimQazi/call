@@ -542,6 +542,15 @@ def check_availability(args: dict) -> dict:
 		}
 
 
+def _openai_version() -> str:
+		try:
+				from importlib.metadata import version
+
+				return version("openai")
+		except Exception:
+				return "unknown"
+
+
 def calculate_cost(usage: dict) -> float:
 		INPUT_TEXT = 5.0 / 1_000_000
 		OUTPUT_TEXT = 20.0 / 1_000_000
@@ -1498,6 +1507,7 @@ reload_menu()
 log.info("=" * 70)
 log.info("Frush web app starting: restaurant=%s menu_items=%d", RESTAURANT, len(MENU))
 log.info("environment: %s", logging_setup.dumps(logging_setup.environment_report(), safe=True))
+log.info("openai sdk: %s", _openai_version())
 log.info("models: %s", logging_setup.dumps({k: v["label"] for k, v in MODEL_OPTIONS.items()}))
 log.info("=" * 70)
 
@@ -1657,8 +1667,22 @@ def endpoint():
 										},
 								}
 						)
+						token = str(getattr(secret, "value", "") or "")
+						# An ephemeral token starts with "ek_". Anything starting with "sk-"
+						# means the project key would be handed to the browser, which the
+						# realtime call endpoint rejects with a 401.
+						log.info(
+								"realtime session created: token_prefix=%r length=%d expires_at=%s",
+								token[:3], len(token), getattr(secret, "expires_at", "?"),
+						)
+						if not token.startswith("ek_"):
+								log.error(
+										"expected an ephemeral ek_ token from client_secrets.create, got prefix %r "
+										"(openai sdk %s) - the browser will be rejected with 401",
+										token[:3], _openai_version(),
+								)
 						return jsonify({
-								"client_secret": secret.value,
+								"client_secret": token,
 								"model": model_config["api_model"],
 								"model_label": model_config["label"],
 								"voice": voice,
