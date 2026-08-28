@@ -575,6 +575,47 @@ def check_availability(args: dict) -> dict:
 		}
 
 
+def model_availability() -> list[dict]:
+		"""Which model options this server is actually configured to run."""
+		livekit_ready = bool(LIVEKIT_URL and os.getenv("LIVEKIT_API_KEY") and os.getenv("LIVEKIT_API_SECRET"))
+		options = []
+		for key, config in MODEL_OPTIONS.items():
+				reason = ""
+				if config["provider"] == "deepseek" and not os.getenv("DEEPSEEK_API_KEY"):
+						reason = "DEEPSEEK_API_KEY is not configured on the server"
+				elif config["provider"] == "openai" and not os.getenv("OPENAI_API_KEY"):
+						reason = "OPENAI_API_KEY is not configured on the server"
+				if not reason and not config["realtime"] and not livekit_ready:
+						reason = "LiveKit is not configured on the server"
+				options.append({
+						"key": key,
+						"label": config["label"],
+						"available": not reason,
+						"reason": reason,
+				})
+		return options
+
+
+def worker_status() -> dict:
+		"""Whether the LiveKit worker has run, from the log it writes.
+
+		The worker is a separate process, so the web app cannot see it directly;
+		the age of logs/agent.log is the closest honest signal.
+		"""
+		path = LOG_DIR / "agent.log"
+		if not path.exists():
+				return {
+						"log_present": False,
+						"hint": "logs/agent.log does not exist - agent.py has never started on this server",
+				}
+		last = logging_setup.tail(path, 1)
+		return {
+				"log_present": True,
+				"log_age_seconds": round(time.time() - path.stat().st_mtime),
+				"last_line": last[0] if last else "",
+		}
+
+
 def _openai_version() -> str:
 		try:
 				from importlib.metadata import version
@@ -919,6 +960,36 @@ INDEX_HTML = """<!DOCTYPE html>
 
 		modelSel.addEventListener("change", updateModelNote);
 		updateModelNote();
+
+		// Grey out models this server has no credentials for, so a call cannot be
+		// started against one and fail at the token step.
+		async function loadModelAvailability() {
+			try {
+				const data = await api("models");
+				let switched = false;
+				(data.models || []).forEach((m) => {
+					const opt = [...modelSel.options].find((o) => o.value === m.key);
+					if (!opt) return;
+					opt.disabled = !m.available;
+					opt.textContent = m.available ? m.label : `${m.label} (unavailable)`;
+					opt.title = m.reason || "";
+					if (!m.available) {
+						CLOG.warn("models", `${m.key} unavailable`, { reason: m.reason });
+						if (modelSel.value === m.key) switched = true;
+					}
+				});
+				if (switched) {
+					const first = [...modelSel.options].find((o) => !o.disabled);
+					if (first) {
+						modelSel.value = first.value;
+						updateModelNote();
+						CLOG.info("models", `switched selection to ${first.value}`);
+					}
+				}
+			} catch (err) {
+				CLOG.warn("models", `could not load availability: ${err.message}`);
+			}
+		}
 
 		async function loadLiveKitClient() {
 			if (livekitClient) return livekitClient;
@@ -1396,6 +1467,7 @@ INDEX_HTML = """<!DOCTYPE html>
 		}
 		voiceSel.addEventListener("change", () => localStorage.setItem("frush_voice", voiceSel.value));
 		loadMenu();
+		loadModelAvailability();
 	</script>
 </body>
 </html>"""
@@ -1612,6 +1684,8 @@ def endpoint():
 
 		if action == "menu":
 				return jsonify(menu_public())
+		if action == "models":
+				return jsonify({"models": model_availability()})
 		if action == "inventory":
 				return jsonify(inventory_public())
 		if action == "orders":
@@ -1806,7 +1880,8 @@ def health():
 				"restaurant": RESTAURANT,
 				"openai_client": client is not None,
 				"menu_items": len(MENU),
-				"models": {k: v["label"] for k, v in MODEL_OPTIONS.items()},
+				"models": model_availability(),
+				"worker": worker_status(),
 				"log_dir": str(LOG_DIR),
 		}
 		if _log_view_authorised():
