@@ -1,0 +1,46 @@
+order_number,item_id,name,size,quantity,unit_price,line_total
+FR-1001,margherita,Margherita Pizza,medium,10,10,100
+FR-1002,veggie,Veggie Supreme Pizza,large,1,16,16
+FR-1002,garlic_bread,Garlic Bread,,1,4,4
+FR-1002,coke,Coke,,1,2,2
+FR-1003,veggie,Veggie Supreme Pizza,large,1,16,16
+FR-1003,coke,Coke,,1,2,2
+FR-1004,margherita,Margherita Pizza,large,1,13,13
+FR-1004,veggie,Veggie Supreme Pizza,large,1,16,16
+FR-1004,tiramisu,Tiramisu,,1,5,5
+FR-1005,veggie,Veggie Supreme Pizza,large,1,16,16
+FR-1005,coke,Coke,,1,2,2
+FR-1006,margherita,Margherita Pizza,large,9,13,117
+FR-1007,veggie,Veggie Supreme Pizza,,1,13,13
+FR-1007,garlic_bread,Garlic Bread,,10,4,40
+FR-1008,bolognese,Spaghetti Bolognese,,1,11,11
+FR-1008,garlic_bread,Garlic Bread,,1,4,4
+FR-1008,coke,Coke,,1,2,2
+FR-1009,pepperoni,Pepperoni Pizza,large,1,15,15
+FR-1010,margherita,Margherita Pizza,large,3,13,39
+FR-1011,pepperoni,Pepperoni Pizza,medium,1,12,12
+FR-1011,veggie,Veggie Supreme Pizza,medium,1,13,13
+FR-1012,pepperoni,Pepperoni Pizza,large,1,15,15
+FR-1012,coke,Coke,,1,2,2
+FR-1013,caesar,Caesar Salad,,1,6,6
+FR-1013,sprite,Sprite,,1,2,2
+FR-1014,veggie,Veggie Supreme Pizza,small,1,13,13
+FR-1015,tiramisu,Tiramisu,,1,5,5
+FR-1016,pepperoni,Pepperoni Pizza,medium,1,12,12
+FR-1016,garlic_bread,Garlic Bread,,1,4,4
+FR-1016,coke,Coke,,3,2,6
+FR-1017,pepperoni,Pepperoni Pizza,large,1,15,15
+FR-1017,bolognese,Spaghetti Bolognese,,1,11,11
+FR-1017,caesar,Caesar Salad,,1,6,6
+FR-1017,coke,Coke,,2,2,4
+FR-1017,sprite,Sprite,,2,2,4
+FR-1017,tiramisu,Tiramisu,,2,5,10
+FR-1018,pepperoni,Pepperoni Pizza,large,2,15,30
+FR-1018,pepperoni,Pepperoni Pizza,small,1,12,12
+FR-1018,garlic_bread,Garlic Bread,,2,4,8
+FR-1018,caesar,Caesar Salad,,1,6,6
+FR-1018,coke,Coke,,2,2,4
+FR-1018,sprite,Sprite,,1,2,2
+FR-1018,tiramisu,Tiramisu,,1,5,5
+FR-1019,garlic_bread,Garlic Bread,,1,4,4
+FR-1019,sprite,Sprite,,1,2,2

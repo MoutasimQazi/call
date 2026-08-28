@@ -1,0 +1,6 @@
+openai>=2.6.1
+flask>=3.0
+python-dotenv>=1.0
+# Only needed for the terminal client (realtime.py):
+sounddevice>=0.5
+numpy>=2.0

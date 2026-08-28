@@ -1,0 +1,12 @@
+id,name,category,price,sized,stock
+margherita,Margherita Pizza,Pizzas,10,yes,1
+pepperoni,Pepperoni Pizza,Pizzas,12,yes,4
+veggie,Veggie Supreme Pizza,Pizzas,13,yes,1
+bolognese,Spaghetti Bolognese,Pasta,11,no,4
+alfredo,Fettuccine Alfredo,Pasta,12,no,6
+garlic_bread,Garlic Bread,Sides,4,no,6
+caesar,Caesar Salad,Sides,6,no,4
+coke,Coke,Drinks,2,no,8
+sprite,Sprite,Drinks,2,no,15
+water,Water,Drinks,2,no,30
+tiramisu,Tiramisu,Desserts,5,no,1
