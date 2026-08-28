@@ -2,23 +2,33 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import secrets
 import string
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, g
 from openai import OpenAI
 from livekit.api import AccessToken, VideoGrants
+from werkzeug.exceptions import HTTPException
+
+import logging_setup
 
 
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
 load_dotenv(override=True)
+
+log = logging_setup.setup_logging("web")
+browser_log = logging_setup.attach_file("browser", "browser.log")
+usage_log = logging_setup.attach_file("usage", "usage.log")
 
 MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1-mini")
 VOICE = os.getenv("OPENAI_REALTIME_VOICE", "shimmer")
@@ -51,14 +61,21 @@ VOICES = ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse",
 SAMPLE_MENU_SIZE = "small"
 
 app = Flask(__name__)
-client = OpenAI()
+
+try:
+		client = OpenAI()
+		log.info("OpenAI client ready")
+except Exception:
+		client = None
+		log.exception("OpenAI client could not be created - realtime sessions will fail")
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 MENU_FILE = DATA_DIR / "menu.csv"
 ORDERS_FILE = DATA_DIR / "orders.csv"
 ITEMS_FILE = DATA_DIR / "order_items.csv"
-LOG_DIR = BASE_DIR / "logs"
+# One log directory for the whole stack (honours the LOG_DIR env var).
+LOG_DIR = logging_setup.LOG_DIR
 LOG_FILE = LOG_DIR / "realtime_cost.log"
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
 
@@ -763,6 +780,58 @@ INDEX_HTML = """<!DOCTYPE html>
 	<audio id="remoteAudio" autoplay></audio>
 	<script src="https://unpkg.com/livekit-client@2.15.6/dist/livekit-client.umd.min.js"></script>
 	<script>
+		// ---- diagnostics ------------------------------------------------
+		// Mirrors every client event to the console and ships it to logs/browser.log.
+		const CLOG = (() => {
+			const history = [];
+			const queue = [];
+			const session = Math.random().toString(36).slice(2, 10);
+			let timer = null;
+			function flush() {
+				timer = null;
+				if (!queue.length) return;
+				const entries = queue.splice(0, queue.length);
+				try {
+					fetch("/", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ action: "client_log", entries }),
+						keepalive: true,
+					}).catch(() => {});
+				} catch {}
+			}
+			function emit(level, scope, message, data) {
+				const entry = {
+					level, scope, session,
+					message: String(message),
+					data: data === undefined ? null : data,
+					ts: new Date().toISOString(),
+				};
+				history.push(entry);
+				if (history.length > 500) history.shift();
+				const fn = console[level === "warning" ? "warn" : level] || console.log;
+				fn.call(console, `[${scope}] ${message}`, data === undefined ? "" : data);
+				queue.push(entry);
+				if (!timer) timer = setTimeout(flush, 800);
+			}
+			window.addEventListener("error", (e) => emit("error", "window", e.message, {
+				file: e.filename, line: e.lineno, col: e.colno, stack: e.error && e.error.stack,
+			}));
+			window.addEventListener("unhandledrejection", (e) => emit("error", "promise",
+				String((e.reason && e.reason.message) || e.reason), { stack: e.reason && e.reason.stack }));
+			window.addEventListener("beforeunload", flush);
+			return {
+				session, flush,
+				debug: (s, m, d) => emit("debug", s, m, d),
+				info: (s, m, d) => emit("info", s, m, d),
+				warn: (s, m, d) => emit("warning", s, m, d),
+				error: (s, m, d) => emit("error", s, m, d),
+				history: () => history.slice(),
+			};
+		})();
+		window.CLOG = CLOG;
+		CLOG.info("boot", "page loaded", { session: CLOG.session, url: location.href, ua: navigator.userAgent });
+
 		const orb = document.getElementById("orb");
 		const orbIcon = document.getElementById("orbIcon");
 		const orbLabel = document.getElementById("orbLabel");
@@ -815,12 +884,23 @@ INDEX_HTML = """<!DOCTYPE html>
 		}
 
 		async function api(action, payload) {
-			const r = await fetch("/", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ action, ...(payload || {}) }),
-			});
-			return r.json();
+			const started = performance.now();
+			CLOG.debug("api", `POST ${action}`, payload || null);
+			try {
+				const r = await fetch("/", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ action, ...(payload || {}) }),
+				});
+				const data = await r.json();
+				const ms = Math.round(performance.now() - started);
+				if (!r.ok) CLOG.error("api", `${action} -> HTTP ${r.status} (${ms}ms)`, data);
+				else CLOG.debug("api", `${action} -> ok (${ms}ms)`, data);
+				return data;
+			} catch (err) {
+				CLOG.error("api", `${action} request failed: ${err.message}`, { stack: err.stack });
+				throw err;
+			}
 		}
 
 		const CAT_ICON = { Pizzas: "🍕", Pasta: "🍝", Sides: "🥗", Drinks: "🥤", Desserts: "🍰" };
@@ -938,17 +1018,34 @@ INDEX_HTML = """<!DOCTYPE html>
 
 		async function start() {
 			try {
+				CLOG.info("call", "start requested", { model: modelSel.value, voice: voiceSel.value });
 				setOrbState("connecting", "Dialing…", "📞");
 				setStatus("Connecting the call…");
 				voiceSel.disabled = true;
 				modelSel.disabled = true;
 				if (modelSel.value !== "realtime-mini-2.1") {
+					CLOG.info("livekit", `requesting token for model ${modelSel.value}`);
 					const tokenResponse = await fetch(`/api/livekit/token?model=${encodeURIComponent(modelSel.value)}`);
 					const tokenData = await tokenResponse.json();
-					if (!tokenResponse.ok) throw new Error(tokenData.error || "Failed to get LiveKit token");
+					if (!tokenResponse.ok) {
+						CLOG.error("livekit", `token request failed (HTTP ${tokenResponse.status})`, tokenData);
+						throw new Error(tokenData.error || "Failed to get LiveKit token");
+					}
+					CLOG.info("livekit", "token received", { room: tokenData.roomName, identity: tokenData.identity, serverUrl: tokenData.serverUrl });
 					livekitClient = await loadLiveKitClient();
+					CLOG.debug("livekit", "client library loaded", { source: window.LivekitClient ? "umd" : "esm" });
 					livekitRoom = new livekitClient.Room();
+					["ParticipantConnected", "ParticipantDisconnected", "TrackPublished",
+					 "ConnectionStateChanged", "Reconnecting", "Reconnected",
+					 "MediaDevicesError", "SignalConnected", "TrackSubscriptionFailed",
+					 "ConnectionQualityChanged"].forEach((name) => {
+						const evt = livekitClient.RoomEvent[name];
+						if (!evt) { CLOG.debug("livekit", `event ${name} not in this client build`); return; }
+						livekitRoom.on(evt, (...args) => CLOG.info("livekit", `event ${name}`,
+							args.map((a) => (a && a.identity) || (a && a.name) || (a && a.sid) || String(a)).slice(0, 4)));
+					});
 					livekitRoom.on(livekitClient.RoomEvent.TrackSubscribed, (track) => {
+						CLOG.info("livekit", `track subscribed (${track.kind})`, { sid: track.sid });
 						if (track.kind === livekitClient.Track.Kind.Audio) {
 							track.attach(remoteAudio);
 							livekitAgentAudio = true;
@@ -958,14 +1055,25 @@ INDEX_HTML = """<!DOCTYPE html>
 					livekitRoom.on(livekitClient.RoomEvent.TrackUnsubscribed, (track) => {
 						if (track.kind === livekitClient.Track.Kind.Audio) track.detach(remoteAudio);
 					});
-					livekitRoom.on(livekitClient.RoomEvent.Disconnected, () => {
+					livekitRoom.on(livekitClient.RoomEvent.Disconnected, (reason) => {
+						CLOG.warn("livekit", "room disconnected", { reason: String(reason), active });
 						if (active) {
 							addMessage("System", "LiveKit disconnected.", "error");
 							stop(true);
 						}
 					});
+					CLOG.info("livekit", `connecting to ${tokenData.serverUrl}`);
 					await livekitRoom.connect(tokenData.serverUrl, tokenData.token);
+					CLOG.info("livekit", "room connected", { room: livekitRoom.name, participants: livekitRoom.numParticipants });
 					await livekitRoom.localParticipant.setMicrophoneEnabled(true);
+					CLOG.info("livekit", "microphone published");
+					setTimeout(() => {
+						if (active && !livekitAgentAudio) {
+							CLOG.error("livekit", "no agent audio after 15s - is the agent.py worker running and registered to this LiveKit project?",
+								{ room: livekitRoom && livekitRoom.name, participants: livekitRoom && livekitRoom.numParticipants });
+							addMessage("System", "⚠️ No agent joined the room. Check the worker logs.", "error");
+						}
+					}, 15000);
 					active = true;
 					modelPill.textContent = `${modelSel.options[modelSel.selectedIndex].text} · LiveKit`;
 					setOrbState("live", "End call", "📵");
@@ -981,17 +1089,35 @@ INDEX_HTML = """<!DOCTYPE html>
 					body: JSON.stringify({ action: "session", voice: voiceSel.value, model: modelSel.value }),
 				});
 				const data = await r.json();
-				if (!r.ok) throw new Error(data.error || "Failed to get session token");
+				if (!r.ok) {
+					CLOG.error("realtime", `session request failed (HTTP ${r.status})`, data);
+					throw new Error(data.error || "Failed to get session token");
+				}
+				CLOG.info("realtime", "ephemeral session created", { model: data.model, voice: data.voice });
 				const EPHEMERAL_KEY = data.client_secret;
 				modelPill.textContent = `${data.model_label || data.model} · ${data.voice}`;
 
 				setStatus("Requesting microphone…");
 				micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
+				CLOG.info("mic", "microphone granted", { tracks: micStream.getAudioTracks().map((t) => t.label) });
+
 				pc = new RTCPeerConnection();
-				pc.ontrack = (e) => { remoteAudio.srcObject = e.streams[0]; };
+				pc.ontrack = (e) => {
+					CLOG.info("webrtc", `remote track received (${e.track.kind})`);
+					remoteAudio.srcObject = e.streams[0];
+				};
 				micStream.getTracks().forEach((t) => pc.addTrack(t, micStream));
+				["iceconnectionstatechange", "icegatheringstatechange", "signalingstatechange"].forEach((name) => {
+					pc.addEventListener(name, () => CLOG.debug("webrtc", name, {
+						ice: pc.iceConnectionState, gathering: pc.iceGatheringState, signaling: pc.signalingState,
+					}));
+				});
+				pc.addEventListener("icecandidateerror", (e) => CLOG.warn("webrtc", "ICE candidate error", {
+					errorCode: e.errorCode, errorText: e.errorText, url: e.url,
+				}));
 				pc.addEventListener("connectionstatechange", () => {
+					CLOG.info("webrtc", `connection state: ${pc && pc.connectionState}`);
 					if (pc && ["failed", "disconnected", "closed"].includes(pc.connectionState) && active) {
 						addMessage("System", "📴 Connection lost.", "system");
 						stop(true);
@@ -1000,8 +1126,29 @@ INDEX_HTML = """<!DOCTYPE html>
 				});
 
 				dc = pc.createDataChannel("oai-events");
-				dc.addEventListener("message", (e) => handleEvent(JSON.parse(e.data)));
-				dc.addEventListener("open", () => { dc.send(JSON.stringify({ type: "response.create" })); });
+				dc.addEventListener("message", (e) => {
+					let evt;
+					try {
+						evt = JSON.parse(e.data);
+					} catch (err) {
+						CLOG.error("datachannel", `unparseable event: ${err.message}`, { raw: String(e.data).slice(0, 500) });
+						return;
+					}
+					if (evt.type === "error") CLOG.error("realtime", "server error event", evt.error || evt);
+					else CLOG.debug("realtime", `event ${evt.type}`,
+						evt.type && evt.type.includes("delta") ? undefined : evt);
+					try {
+						handleEvent(evt);
+					} catch (err) {
+						CLOG.error("realtime", `handleEvent(${evt.type}) threw: ${err.message}`, { stack: err.stack });
+					}
+				});
+				dc.addEventListener("open", () => {
+					CLOG.info("datachannel", "open - requesting first response");
+					dc.send(JSON.stringify({ type: "response.create" }));
+				});
+				dc.addEventListener("close", () => CLOG.warn("datachannel", "closed"));
+				dc.addEventListener("error", (e) => CLOG.error("datachannel", "error", { detail: String(e && e.error) }));
 
 				setStatus("Ringing…");
 				const offer = await pc.createOffer();
@@ -1019,8 +1166,11 @@ INDEX_HTML = """<!DOCTYPE html>
 					}
 				);
 				if (!sdpResp.ok) {
-					throw new Error(`Call failed (${sdpResp.status}): ${await sdpResp.text()}`);
+					const detail = await sdpResp.text();
+					CLOG.error("realtime", `SDP exchange failed (HTTP ${sdpResp.status})`, { detail: detail.slice(0, 800) });
+					throw new Error(`Call failed (${sdpResp.status}): ${detail}`);
 				}
+				CLOG.info("realtime", "SDP answer received");
 				await pc.setRemoteDescription({ type: "answer", sdp: await sdpResp.text() });
 
 				active = true;
@@ -1030,7 +1180,7 @@ INDEX_HTML = """<!DOCTYPE html>
 				setMuted(false);
 				startTimer();
 			} catch (err) {
-				console.error(err);
+				CLOG.error("call", `start() failed: ${err.message}`, { stack: err.stack, model: modelSel.value });
 				addMessage("Error", err.message, "error");
 				setStatus("Couldn't connect the call.");
 				stop(true);
@@ -1038,6 +1188,11 @@ INDEX_HTML = """<!DOCTYPE html>
 		}
 
 		function stop(failed = false) {
+			CLOG.info("call", `stop(failed=${failed})`, {
+				pc: pc && pc.connectionState, dc: dc && dc.readyState,
+				livekit: livekitRoom ? livekitRoom.state : null, agentAudio: livekitAgentAudio,
+			});
+			CLOG.flush();
 			active = false;
 			pendingResponse = false;
 			responseActive = false;
@@ -1068,6 +1223,7 @@ INDEX_HTML = """<!DOCTYPE html>
 		}
 
 		async function runTool(name, args) {
+			CLOG.info("tool", `call ${name}`, args);
 			if (name === "check_availability") {
 				return await api("check_availability", args);
 			}
@@ -1092,8 +1248,22 @@ INDEX_HTML = """<!DOCTYPE html>
 
 		async function handleFunctionCall(item) {
 			let args = {};
-			try { args = JSON.parse(item.arguments || "{}"); } catch {}
-			const result = await runTool(item.name, args);
+			try {
+				args = JSON.parse(item.arguments || "{}");
+			} catch (err) {
+				CLOG.error("tool", `bad arguments for ${item.name}: ${err.message}`, { raw: item.arguments });
+			}
+			let result;
+			try {
+				result = await runTool(item.name, args);
+				CLOG.info("tool", `result ${item.name}`, result);
+			} catch (err) {
+				CLOG.error("tool", `${item.name} threw: ${err.message}`, { stack: err.stack });
+				result = { error: err.message };
+			}
+			if (!dc || dc.readyState !== "open") {
+				CLOG.warn("tool", `cannot return ${item.name} result - data channel is ${dc ? dc.readyState : "gone"}`);
+			}
 			if (!dc || dc.readyState !== "open") return;
 			dc.send(JSON.stringify({
 				type: "conversation.item.create",
@@ -1156,7 +1326,8 @@ INDEX_HTML = """<!DOCTYPE html>
 								usage: usage,
 								cost: cost,
 							}),
-						});
+						}).catch((err) => CLOG.warn("usage", `could not report usage: ${err.message}`));
+						CLOG.info("usage", `response.done cost=$${cost.toFixed(6)}`, usage);
 					}
 					if (pendingResponse && dc && dc.readyState === "open") {
 						pendingResponse = false;
@@ -1164,6 +1335,7 @@ INDEX_HTML = """<!DOCTYPE html>
 					}
 					break;
 				case "error":
+					CLOG.error("realtime", "session error", evt.error);
 					addMessage("Error", JSON.stringify(evt.error), "error");
 					break;
 			}
@@ -1252,8 +1424,12 @@ ADMIN_HTML = """<!DOCTYPE html>
 
 	<script>
 		const NEXT = { confirmed: "preparing", preparing: "ready", ready: "completed" };
+		window.addEventListener("error", (e) => console.error("[admin]", e.message, e.filename, e.lineno));
+		window.addEventListener("unhandledrejection", (e) => console.error("[admin] unhandled rejection", e.reason));
 		async function api(action, body) {
+			console.debug("[admin] POST", action, body || null);
 			const r = await fetch("/", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, ...(body || {}) }) });
+			if (!r.ok) console.error("[admin]", action, "HTTP", r.status);
 			return r.json();
 		}
 		async function setStatus(orderNo, status) { await api("set_status", { order_number: orderNo, status }); refresh(); }
@@ -1314,6 +1490,65 @@ ADMIN_HTML = """<!DOCTYPE html>
 # Routes
 # ---------------------------------------------------------------------------
 reload_menu()
+log.info("=" * 70)
+log.info("Frush web app starting: restaurant=%s menu_items=%d", RESTAURANT, len(MENU))
+log.info("environment: %s", logging_setup.dumps(logging_setup.environment_report(), safe=True))
+log.info("models: %s", logging_setup.dumps({k: v["label"] for k, v in MODEL_OPTIONS.items()}))
+log.info("=" * 70)
+
+
+# ---------------------------------------------------------------------------
+# Request / error logging
+# ---------------------------------------------------------------------------
+@app.before_request
+def _log_request_start():
+		g.request_id = uuid.uuid4().hex[:8]
+		g.request_started = time.monotonic()
+		body = request.get_json(silent=True) if request.is_json else None
+		g.request_action = body.get("action") if isinstance(body, dict) else None
+		log.info(
+				"--> [%s] %s %s action=%s ip=%s ua=%s",
+				g.request_id,
+				request.method,
+				request.path,
+				g.request_action,
+				request.headers.get("X-Forwarded-For", request.remote_addr),
+				(request.headers.get("User-Agent") or "")[:120],
+		)
+		if request.args:
+				log.debug("    [%s] query=%s", g.request_id, logging_setup.dumps(request.args.to_dict()))
+		if body is not None:
+				log.debug("    [%s] payload=%s", g.request_id, logging_setup.dumps(body))
+
+
+@app.after_request
+def _log_request_end(response):
+		rid = getattr(g, "request_id", "--------")
+		elapsed = (time.monotonic() - getattr(g, "request_started", time.monotonic())) * 1000
+		log.info(
+				"<-- [%s] %s %s -> %s (%.0f ms)",
+				rid, request.method, request.path, response.status_code, elapsed,
+		)
+		if response.status_code >= 400 and response.is_json and not response.direct_passthrough:
+				try:
+						log.warning("    [%s] error body=%s", rid, response.get_data(as_text=True)[:1000])
+				except Exception:
+						log.debug("    [%s] error body unavailable", rid)
+		return response
+
+
+@app.errorhandler(Exception)
+def _log_unhandled(exc):
+		rid = getattr(g, "request_id", "--------")
+		if isinstance(exc, HTTPException):
+				log.warning("[%s] %s %s -> %s %s", rid, request.method, request.path, exc.code, exc.name)
+				return exc
+		log.exception("!!! [%s] unhandled exception on %s %s", rid, request.method, request.path)
+		return jsonify({
+				"error": str(exc),
+				"type": exc.__class__.__name__,
+				"request_id": rid,
+		}), 500
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -1325,6 +1560,7 @@ def endpoint():
 
 		body = request.get_json(silent=True) or {}
 		action = body.get("action", "")
+		log.debug("[%s] dispatching action=%r keys=%s", getattr(g, "request_id", "?"), action, sorted(body.keys()))
 
 		if action == "menu":
 				return jsonify(menu_public())
@@ -1354,10 +1590,33 @@ def endpoint():
 						"cost": total_cost,
 				}
 
-				with LOG_FILE.open("a", encoding="utf-8") as f:
-						f.write(json.dumps(data) + "\n")
+				try:
+						with LOG_FILE.open("a", encoding="utf-8") as f:
+								f.write(json.dumps(data) + "\n")
+				except Exception:
+						log.exception("could not append to %s", LOG_FILE)
+				usage_log.info("call usage %s", logging_setup.dumps(data))
 
 				return jsonify({"success": True})
+		if action == "client_log":
+				entries = body.get("entries")
+				if not isinstance(entries, list):
+						entries = [entries] if entries else []
+				for entry in entries[:200]:
+						if not isinstance(entry, dict):
+								entry = {"message": entry}
+						level = getattr(logging, str(entry.get("level", "info")).upper(), logging.INFO)
+						if not isinstance(level, int):
+								level = logging.INFO
+						browser_log.log(
+								level,
+								"[%s/%s] %s | %s",
+								entry.get("session", "?"),
+								entry.get("scope", "client"),
+								entry.get("message", ""),
+								logging_setup.dumps(entry.get("data")),
+						)
+				return jsonify({"success": True, "received": len(entries)})
 		if action == "place_order":
 				return jsonify(place(body.get("customer_name", ""), body.get("fulfillment", "pickup"), body.get("items") or []))
 		if action == "session":
@@ -1371,6 +1630,10 @@ def endpoint():
 								"error": f'{model_config["label"]} is not supported by the current OpenAI Realtime WebRTC call. '
 								"A LiveKit agent or a separate audio gateway is required for this model."
 						}), 400
+				if client is None:
+						log.error("realtime session requested but the OpenAI client failed to initialise")
+						return jsonify({"error": "OpenAI client is not configured on the server"}), 503
+				log.info("creating realtime session model=%s voice=%s", model_config["api_model"], voice)
 				try:
 						secret = client.realtime.client_secrets.create(
 								session={
@@ -1396,13 +1659,21 @@ def endpoint():
 								"voice": voice,
 						})
 				except Exception as exc:
-						return jsonify({"error": str(exc)}), 500
+						log.exception("realtime session creation failed for model=%s", model_config["api_model"])
+						return jsonify({"error": str(exc), "type": exc.__class__.__name__}), 500
+		log.warning("unknown action %r (payload keys: %s)", action, sorted(body.keys()))
 		return jsonify({"error": f"unknown action '{action}'"}), 400
 
 
 @app.get("/api/livekit/token")
 def livekit_token():
 		if not LIVEKIT_URL or not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
+				log.error(
+						"LiveKit config incomplete: url=%s api_key=%s api_secret=%s",
+						LIVEKIT_URL or "MISSING",
+						"set" if os.getenv("LIVEKIT_API_KEY") else "MISSING",
+						"set" if os.getenv("LIVEKIT_API_SECRET") else "MISSING",
+				)
 				return jsonify({"error": "LiveKit server configuration is incomplete"}), 503
 
 		room_name = (request.args.get("room") or "").strip()
@@ -1435,9 +1706,58 @@ def livekit_token():
 						))
 						.to_jwt()
 				)
+				log.info(
+						"issued LiveKit token: room=%s identity=%s model=%s server=%s",
+						room_name, identity, model_key, LIVEKIT_URL,
+				)
 				return jsonify({"token": token, "serverUrl": LIVEKIT_URL, "roomName": room_name, "identity": identity})
 		except Exception as exc:
-				return jsonify({"error": str(exc)}), 500
+				log.exception("LiveKit token generation failed for room=%s model=%s", room_name, model_key)
+				return jsonify({"error": str(exc), "type": exc.__class__.__name__}), 500
+
+
+def _log_view_authorised() -> bool:
+		token = os.getenv("LOG_VIEW_TOKEN", "")
+		if not token:
+				return False
+		supplied = request.args.get("token") or request.headers.get("X-Log-Token", "")
+		return secrets.compare_digest(supplied, token)
+
+
+@app.get("/api/health")
+def health():
+		info = {
+				"ok": True,
+				"restaurant": RESTAURANT,
+				"openai_client": client is not None,
+				"menu_items": len(MENU),
+				"models": {k: v["label"] for k, v in MODEL_OPTIONS.items()},
+				"log_dir": str(LOG_DIR),
+		}
+		if _log_view_authorised():
+				info["environment"] = logging_setup.environment_report()
+		return jsonify(info)
+
+
+@app.get("/api/logs")
+def read_logs():
+		if not os.getenv("LOG_VIEW_TOKEN"):
+				return jsonify({"error": "log viewing disabled; set LOG_VIEW_TOKEN to enable"}), 404
+		if not _log_view_authorised():
+				log.warning("rejected /api/logs request from %s", request.remote_addr)
+				return jsonify({"error": "unauthorized"}), 403
+		name = request.args.get("file", "web.log")
+		if "/" in name or "\\" in name or name.startswith("."):
+				return jsonify({"error": "invalid file name"}), 400
+		try:
+				lines = max(1, min(int(request.args.get("lines", 200)), 5000))
+		except ValueError:
+				lines = 200
+		return jsonify({
+				"file": name,
+				"available": sorted(p.name for p in LOG_DIR.glob("*") if p.is_file()),
+				"lines": logging_setup.tail(LOG_DIR / name, lines),
+		})
 
 
 if __name__ == "__main__":

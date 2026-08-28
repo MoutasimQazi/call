@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+# Log files contain customer order data - never commit them.
+logs/*.log
+logs/*.log.*
+logs/*.jsonl
+logs/*.jsonl.*
+
+.env
