@@ -1060,7 +1060,8 @@ INDEX_HTML = """<!DOCTYPE html>
 						if (track.kind === livekitClient.Track.Kind.Audio) track.detach(remoteAudio);
 					});
 					livekitRoom.on(livekitClient.RoomEvent.Disconnected, (reason) => {
-						CLOG.warn("livekit", "room disconnected", { reason: String(reason), active });
+						// Expected when the caller hangs up; only a drop mid-call is a problem.
+						(active ? CLOG.warn : CLOG.info)("livekit", "room disconnected", { reason: String(reason), active });
 						if (active) {
 							addMessage("System", "LiveKit disconnected.", "error");
 							stop(true);
@@ -1726,6 +1727,19 @@ def _log_view_authorised() -> bool:
 				return False
 		supplied = request.args.get("token") or request.headers.get("X-Log-Token", "")
 		return secrets.compare_digest(supplied, token)
+
+
+FAVICON = (
+		'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+		'<text y=".9em" font-size="90">🍕</text></svg>'
+)
+
+
+@app.get("/favicon.ico")
+def favicon():
+		response = Response(FAVICON, mimetype="image/svg+xml")
+		response.headers["Cache-Control"] = "public, max-age=86400"
+		return response
 
 
 @app.get("/api/health")
