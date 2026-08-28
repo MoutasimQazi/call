@@ -1,6 +1,9 @@
 openai>=2.6.1
 flask>=3.0
 python-dotenv>=1.0
-# Only needed for the terminal client (realtime.py):
+livekit-api>=1.0.0
+livekit-agents>=1.0.0
+livekit-plugins-openai>=1.0.0
+livekit-plugins-elevenlabs>=1.0.0
 sounddevice>=0.5
 numpy>=2.0

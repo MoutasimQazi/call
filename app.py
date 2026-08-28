@@ -1,22 +1,18 @@
-"""
-Single-file Frush voice ordering app.
-
-This file combines the backend, menu store, order pipeline, voice session
-endpoint, storefront page, and kitchen page so the app runs from one place.
-"""
-
 from __future__ import annotations
 
 import csv
 import json
 import os
-from datetime import datetime, timezone
+import secrets
+import string
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, Response
 from openai import OpenAI
+from livekit.api import AccessToken, VideoGrants
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +22,30 @@ load_dotenv(override=True)
 
 MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1-mini")
 VOICE = os.getenv("OPENAI_REALTIME_VOICE", "shimmer")
+TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", VOICE)
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "iP95p4xoKVk53GoZ742B")
 RESTAURANT = os.getenv("RESTAURANT_NAME", "Frush")
+
+MODEL_OPTIONS = {
+		"realtime-mini-2.1": {
+				"label": "Realtime Mini 2.1",
+				"provider": "openai",
+				"api_model": MODEL,
+				"realtime": True,
+		},
+		"gpt-4o-mini": {
+				"label": "GPT-4o Mini",
+				"provider": "openai",
+				"api_model": "gpt-4o-mini",
+				"realtime": False,
+		},
+		"deepseek-v4-flash": {
+				"label": "DeepSeek V4 Flash",
+				"provider": "deepseek",
+				"api_model": "deepseek-v4-flash",
+				"realtime": False,
+		},
+}
 
 VOICES = ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"]
 SAMPLE_MENU_SIZE = "small"
@@ -41,6 +60,7 @@ ORDERS_FILE = DATA_DIR / "orders.csv"
 ITEMS_FILE = DATA_DIR / "order_items.csv"
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / "realtime_cost.log"
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
 
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -597,6 +617,9 @@ INDEX_HTML = """<!DOCTYPE html>
 			padding: 7px 10px; font-size: .9rem; cursor: pointer; min-width: 140px;
 		}
 		.voice-row select:disabled { opacity: .5; cursor: not-allowed; }
+		.model-row { margin-top: 10px; }
+		.model-row select { min-width: 190px; }
+		.model-note { display: block; margin-top: 5px; color: var(--muted); font-size: .72rem; }
 		.phone-stage { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 26px 0 22px; }
 		.callbtn {
 			position: relative; width: 96px; height: 96px; border: none; border-radius: 50%; cursor: pointer;
@@ -698,6 +721,15 @@ INDEX_HTML = """<!DOCTYPE html>
 						<option value="cedar">Cedar</option>
 					</select>
 				</label>
+				<label class="voice-row model-row">
+					<span>Language model</span>
+					<select id="modelSelect" aria-describedby="modelNote">
+						<option value="realtime-mini-2.1" selected>Realtime Mini 2.1</option>
+						<option value="gpt-4o-mini">GPT-4o Mini</option>
+						<option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
+					</select>
+				</label>
+				<span id="modelNote" class="model-note">Voice calls use OpenAI Realtime WebRTC.</span>
 
 				<div class="phone-stage">
 					<button id="orb" class="callbtn" aria-label="Start or end call">
@@ -729,6 +761,7 @@ INDEX_HTML = """<!DOCTYPE html>
 	</div>
 
 	<audio id="remoteAudio" autoplay></audio>
+	<script src="https://unpkg.com/livekit-client@2.15.6/dist/livekit-client.umd.min.js"></script>
 	<script>
 		const orb = document.getElementById("orb");
 		const orbIcon = document.getElementById("orbIcon");
@@ -736,6 +769,8 @@ INDEX_HTML = """<!DOCTYPE html>
 		const statusEl = document.getElementById("status");
 		const timerEl = document.getElementById("timer");
 		const voiceSel = document.getElementById("voice");
+		const modelSel = document.getElementById("modelSelect");
+		const modelNote = document.getElementById("modelNote");
 		const transcriptEl = document.getElementById("transcript");
 		const modelPill = document.getElementById("model");
 		const remoteAudio = document.getElementById("remoteAudio");
@@ -753,8 +788,31 @@ INDEX_HTML = """<!DOCTYPE html>
 		let pendingResponse = false;
 		let responseActive = false;
 		let muted = false;
+		let livekitRoom = null;
+		let livekitClient = null;
+		let livekitAgentAudio = false;
 
 		function setStatus(text) { statusEl.textContent = text; }
+
+		function updateModelNote() {
+			const realtime = modelSel.value === "realtime-mini-2.1";
+			voiceSel.disabled = realtime ? active : true;
+			modelNote.textContent = realtime
+				? "Voice calls use OpenAI Realtime WebRTC."
+				: "Fixed ElevenLabs voice delivered through LiveKit.";
+		}
+
+		modelSel.addEventListener("change", updateModelNote);
+		updateModelNote();
+
+		async function loadLiveKitClient() {
+			if (livekitClient) return livekitClient;
+			livekitClient = window.LivekitClient || window.LiveKitClient;
+			if (!livekitClient) {
+				livekitClient = await import("https://cdn.jsdelivr.net/npm/livekit-client@2.15.6/+esm");
+			}
+			return livekitClient;
+		}
 
 		async function api(action, payload) {
 			const r = await fetch("/", {
@@ -883,15 +941,49 @@ INDEX_HTML = """<!DOCTYPE html>
 				setOrbState("connecting", "Dialing…", "📞");
 				setStatus("Connecting the call…");
 				voiceSel.disabled = true;
+				modelSel.disabled = true;
+				if (modelSel.value !== "realtime-mini-2.1") {
+					const tokenResponse = await fetch(`/api/livekit/token?model=${encodeURIComponent(modelSel.value)}`);
+					const tokenData = await tokenResponse.json();
+					if (!tokenResponse.ok) throw new Error(tokenData.error || "Failed to get LiveKit token");
+					livekitClient = await loadLiveKitClient();
+					livekitRoom = new livekitClient.Room();
+					livekitRoom.on(livekitClient.RoomEvent.TrackSubscribed, (track) => {
+						if (track.kind === livekitClient.Track.Kind.Audio) {
+							track.attach(remoteAudio);
+							livekitAgentAudio = true;
+							setStatus("Mario is on the line — go ahead and order.");
+						}
+					});
+					livekitRoom.on(livekitClient.RoomEvent.TrackUnsubscribed, (track) => {
+						if (track.kind === livekitClient.Track.Kind.Audio) track.detach(remoteAudio);
+					});
+					livekitRoom.on(livekitClient.RoomEvent.Disconnected, () => {
+						if (active) {
+							addMessage("System", "LiveKit disconnected.", "error");
+							stop(true);
+						}
+					});
+					await livekitRoom.connect(tokenData.serverUrl, tokenData.token);
+					await livekitRoom.localParticipant.setMicrophoneEnabled(true);
+					active = true;
+					modelPill.textContent = `${modelSel.options[modelSel.selectedIndex].text} · LiveKit`;
+					setOrbState("live", "End call", "📵");
+					setStatus("Connected to LiveKit — waiting for Mario…");
+					muteBtn.hidden = false;
+					setMuted(false);
+					startTimer();
+					return;
+				}
 				const r = await fetch("/", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ action: "session", voice: voiceSel.value }),
+					body: JSON.stringify({ action: "session", voice: voiceSel.value, model: modelSel.value }),
 				});
 				const data = await r.json();
 				if (!r.ok) throw new Error(data.error || "Failed to get session token");
 				const EPHEMERAL_KEY = data.client_secret;
-				modelPill.textContent = `${data.model} · ${data.voice}`;
+				modelPill.textContent = `${data.model_label || data.model} · ${data.voice}`;
 
 				setStatus("Requesting microphone…");
 				micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -954,10 +1046,14 @@ INDEX_HTML = """<!DOCTYPE html>
 			if (hangupTimer) { clearTimeout(hangupTimer); hangupTimer = null; }
 			if (dc) { try { dc.close(); } catch {} dc = null; }
 			if (pc) { try { pc.close(); } catch {} pc = null; }
+			if (livekitRoom) { try { livekitRoom.disconnect(); } catch {} livekitRoom = null; }
+			livekitAgentAudio = false;
 			if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
 			liveAssistant = null;
 			assistantBuffer = "";
 			voiceSel.disabled = false;
+			modelSel.disabled = false;
+			updateModelNote();
 			muteBtn.hidden = true;
 			setOrbState(null, "Call to order", "📞");
 			if (!failed) setStatus("Call ended. Thanks for ordering!");
@@ -966,6 +1062,7 @@ INDEX_HTML = """<!DOCTYPE html>
 		function setMuted(m) {
 			muted = m;
 			if (micStream) micStream.getAudioTracks().forEach((t) => (t.enabled = !m));
+			if (livekitRoom) livekitRoom.localParticipant.setMicrophoneEnabled(!m);
 			muteBtn.textContent = m ? "🔇 Unmute" : "🎙️ Mute";
 			muteBtn.classList.toggle("muted", m);
 		}
@@ -1265,11 +1362,20 @@ def endpoint():
 				return jsonify(place(body.get("customer_name", ""), body.get("fulfillment", "pickup"), body.get("items") or []))
 		if action == "session":
 				voice = body.get("voice") if body.get("voice") in VOICES else VOICE
+				model_key = body.get("model", "realtime-mini-2.1")
+				model_config = MODEL_OPTIONS.get(model_key)
+				if model_config is None:
+						return jsonify({"error": "Unknown model selection"}), 400
+				if not model_config["realtime"]:
+						return jsonify({
+								"error": f'{model_config["label"]} is not supported by the current OpenAI Realtime WebRTC call. '
+								"A LiveKit agent or a separate audio gateway is required for this model."
+						}), 400
 				try:
 						secret = client.realtime.client_secrets.create(
 								session={
 										"type": "realtime",
-										"model": MODEL,
+										"model": model_config["api_model"],
 										"instructions": build_instructions(),
 										"output_modalities": ["audio"],
 										"tools": TOOLS,
@@ -1283,10 +1389,55 @@ def endpoint():
 										},
 								}
 						)
-						return jsonify({"client_secret": secret.value, "model": MODEL, "voice": voice})
+						return jsonify({
+								"client_secret": secret.value,
+								"model": model_config["api_model"],
+								"model_label": model_config["label"],
+								"voice": voice,
+						})
 				except Exception as exc:
 						return jsonify({"error": str(exc)}), 500
 		return jsonify({"error": f"unknown action '{action}'"}), 400
+
+
+@app.get("/api/livekit/token")
+def livekit_token():
+		if not LIVEKIT_URL or not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
+				return jsonify({"error": "LiveKit server configuration is incomplete"}), 503
+
+		room_name = (request.args.get("room") or "").strip()
+		identity = (request.args.get("username") or "").strip()
+		model_key = request.args.get("model", "gpt-4o-mini")
+		if model_key not in MODEL_OPTIONS:
+				return jsonify({"error": "Unknown model selection"}), 400
+		if model_key == "deepseek-v4-flash" and not os.getenv("DEEPSEEK_API_KEY"):
+				return jsonify({"error": "DEEPSEEK_API_KEY is not configured on the server"}), 503
+		if model_key == "gpt-4o-mini" and not os.getenv("OPENAI_API_KEY"):
+				return jsonify({"error": "OPENAI_API_KEY is not configured on the server"}), 503
+		if not room_name:
+				alphabet = string.ascii_lowercase + string.digits
+				room_name = "frush-" + model_key + "-" + "".join(secrets.choice(alphabet) for _ in range(16))
+		if not identity:
+				identity = "guest-" + secrets.token_hex(6)
+
+		try:
+				token = (
+						AccessToken(os.getenv("LIVEKIT_API_KEY"), os.getenv("LIVEKIT_API_SECRET"))
+						.with_identity(identity)
+						.with_name(identity)
+						.with_ttl(timedelta(hours=1))
+						.with_grants(VideoGrants(
+								room_join=True,
+								room=room_name,
+								can_publish=True,
+								can_subscribe=True,
+								can_publish_data=True,
+						))
+						.to_jwt()
+				)
+				return jsonify({"token": token, "serverUrl": LIVEKIT_URL, "roomName": room_name, "identity": identity})
+		except Exception as exc:
+				return jsonify({"error": str(exc)}), 500
 
 
 if __name__ == "__main__":
