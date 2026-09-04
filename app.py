@@ -616,6 +616,79 @@ def worker_status() -> dict:
 		}
 
 
+def issue_livekit_token(model_key: str, room_name: str = "", identity: str = "") -> tuple[dict, int]:
+		"""Build a LiveKit room-join token. Shared by the /api/livekit/token route
+		and the "livekit_token" action on POST / - the server's URL routing only
+		reliably reaches the single "/" endpoint, so the POST action is the path
+		actually used by the browser.
+		"""
+		if not LIVEKIT_URL or not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
+				log.error(
+						"LiveKit config incomplete: url=%s api_key=%s api_secret=%s",
+						LIVEKIT_URL or "MISSING",
+						"set" if os.getenv("LIVEKIT_API_KEY") else "MISSING",
+						"set" if os.getenv("LIVEKIT_API_SECRET") else "MISSING",
+				)
+				return {"error": "LiveKit server configuration is incomplete"}, 503
+
+		room_name = (room_name or "").strip()
+		identity = (identity or "").strip()
+		model_key = model_key or "gpt-4o-mini"
+		if model_key not in MODEL_OPTIONS:
+				return {"error": "Unknown model selection"}, 400
+		if model_key == "deepseek-v4-flash" and not os.getenv("DEEPSEEK_API_KEY"):
+				return {"error": "DEEPSEEK_API_KEY is not configured on the server"}, 503
+		if model_key == "gpt-4o-mini" and not os.getenv("OPENAI_API_KEY"):
+				return {"error": "OPENAI_API_KEY is not configured on the server"}, 503
+		if not room_name:
+				alphabet = string.ascii_lowercase + string.digits
+				room_name = "frush-" + model_key + "-" + "".join(secrets.choice(alphabet) for _ in range(16))
+		if not identity:
+				identity = "guest-" + secrets.token_hex(6)
+
+		try:
+				token = (
+						AccessToken(os.getenv("LIVEKIT_API_KEY"), os.getenv("LIVEKIT_API_SECRET"))
+						.with_identity(identity)
+						.with_name(identity)
+						.with_ttl(timedelta(hours=1))
+						.with_grants(VideoGrants(
+								room_join=True,
+								room=room_name,
+								can_publish=True,
+								can_subscribe=True,
+								can_publish_data=True,
+						))
+						.to_jwt()
+				)
+				log.info(
+						"issued LiveKit token: room=%s identity=%s model=%s server=%s",
+						room_name, identity, model_key, LIVEKIT_URL,
+				)
+				return {"token": token, "serverUrl": LIVEKIT_URL, "roomName": room_name, "identity": identity}, 200
+		except Exception as exc:
+				log.exception("LiveKit token generation failed for room=%s model=%s", room_name, model_key)
+				return {"error": str(exc), "type": exc.__class__.__name__}, 500
+
+
+def health_info() -> dict:
+		"""Diagnostic snapshot, shared by the /api/health route and the "health"
+		action on POST / (the one the app itself relies on - see issue_livekit_token).
+		"""
+		info = {
+				"ok": True,
+				"restaurant": RESTAURANT,
+				"openai_client": client is not None,
+				"menu_items": len(MENU),
+				"models": model_availability(),
+				"worker": worker_status(),
+				"log_dir": str(LOG_DIR),
+		}
+		if _log_view_authorised():
+				info["environment"] = logging_setup.environment_report()
+		return info
+
+
 def _openai_version() -> str:
 		try:
 				from importlib.metadata import version
@@ -651,6 +724,7 @@ INDEX_HTML = """<!DOCTYPE html>
 	<meta name="theme-color" content="#14100c" />
 	<meta name="description" content="Order Frush pizza, pasta and more by voice — Mario picks up instantly, no app or hold music." />
 	<title>Frush · Order by Voice</title>
+	<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8D%95%3C/text%3E%3C/svg%3E" />
 	<link rel="preconnect" href="https://fonts.googleapis.com" />
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 	<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -1183,10 +1257,9 @@ INDEX_HTML = """<!DOCTYPE html>
 				modelSel.disabled = true;
 				if (modelSel.value !== "realtime-mini-2.1") {
 					CLOG.info("livekit", `requesting token for model ${modelSel.value}`);
-					const tokenResponse = await fetch(`/api/livekit/token?model=${encodeURIComponent(modelSel.value)}`);
-					const tokenData = await tokenResponse.json();
-					if (!tokenResponse.ok) {
-						CLOG.error("livekit", `token request failed (HTTP ${tokenResponse.status})`, tokenData);
+					const tokenData = await api("livekit_token", { model: modelSel.value });
+					if (tokenData.error) {
+						CLOG.error("livekit", "token request failed", tokenData);
 						throw new Error(tokenData.error || "Failed to get LiveKit token");
 					}
 					CLOG.info("livekit", "token received", { room: tokenData.roomName, identity: tokenData.identity, serverUrl: tokenData.serverUrl });
@@ -1521,6 +1594,7 @@ ADMIN_HTML = """<!DOCTYPE html>
 	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 	<meta name="theme-color" content="#14100c" />
 	<title>Frush · Kitchen</title>
+	<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8D%95%3C/text%3E%3C/svg%3E" />
 	<link rel="preconnect" href="https://fonts.googleapis.com" />
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 	<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -1767,6 +1841,13 @@ def endpoint():
 				return jsonify(menu_public())
 		if action == "models":
 				return jsonify({"models": model_availability()})
+		if action == "health":
+				return jsonify(health_info())
+		if action == "livekit_token":
+				payload, status = issue_livekit_token(
+						body.get("model", "gpt-4o-mini"), body.get("room", ""), body.get("username", "")
+				)
+				return jsonify(payload), status
 		if action == "inventory":
 				return jsonify(inventory_public())
 		if action == "orders":
@@ -1884,53 +1965,14 @@ def endpoint():
 
 @app.get("/api/livekit/token")
 def livekit_token():
-		if not LIVEKIT_URL or not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
-				log.error(
-						"LiveKit config incomplete: url=%s api_key=%s api_secret=%s",
-						LIVEKIT_URL or "MISSING",
-						"set" if os.getenv("LIVEKIT_API_KEY") else "MISSING",
-						"set" if os.getenv("LIVEKIT_API_SECRET") else "MISSING",
-				)
-				return jsonify({"error": "LiveKit server configuration is incomplete"}), 503
-
-		room_name = (request.args.get("room") or "").strip()
-		identity = (request.args.get("username") or "").strip()
-		model_key = request.args.get("model", "gpt-4o-mini")
-		if model_key not in MODEL_OPTIONS:
-				return jsonify({"error": "Unknown model selection"}), 400
-		if model_key == "deepseek-v4-flash" and not os.getenv("DEEPSEEK_API_KEY"):
-				return jsonify({"error": "DEEPSEEK_API_KEY is not configured on the server"}), 503
-		if model_key == "gpt-4o-mini" and not os.getenv("OPENAI_API_KEY"):
-				return jsonify({"error": "OPENAI_API_KEY is not configured on the server"}), 503
-		if not room_name:
-				alphabet = string.ascii_lowercase + string.digits
-				room_name = "frush-" + model_key + "-" + "".join(secrets.choice(alphabet) for _ in range(16))
-		if not identity:
-				identity = "guest-" + secrets.token_hex(6)
-
-		try:
-				token = (
-						AccessToken(os.getenv("LIVEKIT_API_KEY"), os.getenv("LIVEKIT_API_SECRET"))
-						.with_identity(identity)
-						.with_name(identity)
-						.with_ttl(timedelta(hours=1))
-						.with_grants(VideoGrants(
-								room_join=True,
-								room=room_name,
-								can_publish=True,
-								can_subscribe=True,
-								can_publish_data=True,
-						))
-						.to_jwt()
-				)
-				log.info(
-						"issued LiveKit token: room=%s identity=%s model=%s server=%s",
-						room_name, identity, model_key, LIVEKIT_URL,
-				)
-				return jsonify({"token": token, "serverUrl": LIVEKIT_URL, "roomName": room_name, "identity": identity})
-		except Exception as exc:
-				log.exception("LiveKit token generation failed for room=%s model=%s", room_name, model_key)
-				return jsonify({"error": str(exc), "type": exc.__class__.__name__}), 500
+		"""Kept for direct/manual use. The app itself calls the "livekit_token"
+		action on POST / instead, since this server only reliably routes the
+		bare "/" path (see issue_livekit_token's docstring).
+		"""
+		payload, status = issue_livekit_token(
+				request.args.get("model", "gpt-4o-mini"), request.args.get("room", ""), request.args.get("username", "")
+		)
+		return jsonify(payload), status
 
 
 def _log_view_authorised() -> bool:
@@ -1956,18 +1998,11 @@ def favicon():
 
 @app.get("/api/health")
 def health():
-		info = {
-				"ok": True,
-				"restaurant": RESTAURANT,
-				"openai_client": client is not None,
-				"menu_items": len(MENU),
-				"models": model_availability(),
-				"worker": worker_status(),
-				"log_dir": str(LOG_DIR),
-		}
-		if _log_view_authorised():
-				info["environment"] = logging_setup.environment_report()
-		return jsonify(info)
+		"""Kept for direct/manual use. The app itself calls the "health" action
+		on POST / instead, since this server only reliably routes the bare "/"
+		path (see health_info's docstring).
+		"""
+		return jsonify(health_info())
 
 
 @app.get("/api/logs")
