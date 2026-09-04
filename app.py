@@ -925,6 +925,40 @@ INDEX_HTML = """<!DOCTYPE html>
 		.order-meta { color: var(--muted); font-size: .82rem; }
 		.order-total { font-size: .95rem; }
 		.order-total strong { color: var(--green); font-family: var(--font-display); font-size: 1.05rem; }
+
+		/* motion, loading states, a11y */
+		:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; border-radius: 4px; }
+		@keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+		@keyframes msgIn { from { opacity: 0; transform: translateY(6px) scale(.98); } to { opacity: 1; transform: none; } }
+		@keyframes cardIn { from { opacity: 0; transform: translateY(8px) scale(.97); } to { opacity: 1; transform: none; } }
+		@keyframes shimmer { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
+		@keyframes softPulse { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
+		.hero { animation: fadeUp .5s ease both; }
+		.grid > *:nth-child(1) { animation: fadeUp .5s .08s ease both; }
+		.grid > *:nth-child(2) { animation: fadeUp .5s .16s ease both; }
+		.msg { animation: msgIn .22s ease both; }
+		.order-card:not([hidden]) { animation: cardIn .4s cubic-bezier(.16,1,.3,1) both; }
+		.phone-stage { position: relative; }
+		.phone-stage::before {
+			content: ""; position: absolute; top: 26px; left: 50%; transform: translateX(-50%);
+			width: 120px; height: 120px; border-radius: 50%;
+			background: radial-gradient(circle, rgba(63,174,90,.28), transparent 70%); filter: blur(4px);
+			animation: softPulse 2.6s ease-in-out infinite; pointer-events: none; z-index: 0;
+		}
+		.callbtn, .callbtn-label, .mutebtn { position: relative; z-index: 1; }
+		.skel {
+			border-radius: 8px; background: linear-gradient(90deg, var(--line-soft) 25%, var(--panel-3) 37%, var(--line-soft) 63%);
+			background-size: 400% 100%; animation: shimmer 1.4s ease infinite;
+		}
+		.skel-h3 { height: 12px; width: 40%; margin-bottom: 10px; }
+		.skel-li { height: 16px; width: 100%; margin-bottom: 10px; }
+		.skel-li:last-child { width: 70%; margin-bottom: 0; }
+		@media (prefers-reduced-motion: reduce) {
+			*, *::before, *::after {
+				animation-duration: .01ms !important; animation-iteration-count: 1 !important;
+				transition-duration: .01ms !important; scroll-behavior: auto !important;
+			}
+		}
 	</style>
 </head>
 <body>
@@ -938,10 +972,22 @@ INDEX_HTML = """<!DOCTYPE html>
 			<span id="model" class="model-pill" title="Model in use">—</span>
 		</header>
 
-		<div class="grid">
+		<main class="grid">
 			<section class="card menu">
 				<h2>Menu <span id="menuNote" class="note">live stock</span></h2>
-				<div id="menuList"><p class="hint">Loading menu…</p></div>
+				<div id="menuList" aria-busy="true">
+					<div class="menu-group">
+						<div class="skel skel-h3"></div>
+						<div class="skel skel-li"></div>
+						<div class="skel skel-li"></div>
+						<div class="skel skel-li"></div>
+					</div>
+					<div class="menu-group">
+						<div class="skel skel-h3"></div>
+						<div class="skel skel-li"></div>
+						<div class="skel skel-li"></div>
+					</div>
+				</div>
 			</section>
 
 			<section class="card call">
@@ -999,7 +1045,7 @@ INDEX_HTML = """<!DOCTYPE html>
 					</div>
 				</div>
 			</section>
-		</div>
+		</main>
 
 		<footer class="foot">🔒 Your mic audio streams securely; your API key never leaves the server. · <a href="/?view=admin">Kitchen view</a></footer>
 	</div>
@@ -1190,8 +1236,10 @@ INDEX_HTML = """<!DOCTYPE html>
 					group.appendChild(ul);
 					menuList.appendChild(group);
 				}
+				menuList.removeAttribute("aria-busy");
 			} catch {
 				menuList.innerHTML = `<p class="hint">Could not load the menu.</p>`;
+				menuList.removeAttribute("aria-busy");
 			}
 		}
 
@@ -1697,6 +1745,27 @@ ADMIN_HTML = """<!DOCTYPE html>
 			padding: 4px 7px; font-size: .82rem; text-align: right;
 		}
 		.inv input:focus { outline: none; border-color: var(--gold); }
+
+		/* motion, loading states, a11y */
+		:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; border-radius: 4px; }
+		@keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+		@keyframes shimmer { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
+		@keyframes badgeIn { from { transform: scale(.9); opacity: .6; } to { transform: none; opacity: 1; } }
+		header { animation: fadeUp .4s ease both; }
+		.cols > *:nth-child(1) { animation: fadeUp .4s .06s ease both; }
+		.cols > *:nth-child(2) { animation: fadeUp .4s .12s ease both; }
+		.badge { animation: badgeIn .2s ease both; transition: background-color .2s ease, color .2s ease; }
+		.skel {
+			border-radius: 8px; background: linear-gradient(90deg, var(--line-soft, var(--line)) 25%, var(--panel-3) 37%, var(--line-soft, var(--line)) 63%);
+			background-size: 400% 100%; animation: shimmer 1.4s ease infinite;
+		}
+		.skel-row { height: 52px; border-radius: 12px; margin-bottom: 12px; }
+		@media (prefers-reduced-motion: reduce) {
+			*, *::before, *::after {
+				animation-duration: .01ms !important; animation-iteration-count: 1 !important;
+				transition-duration: .01ms !important; scroll-behavior: auto !important;
+			}
+		}
 	</style>
 </head>
 <body>
@@ -1711,12 +1780,18 @@ ADMIN_HTML = """<!DOCTYPE html>
 		<div class="cols">
 			<section class="panel">
 				<h2>📋 Orders</h2>
-				<div id="orders"><p class="empty">No orders yet.</p></div>
+				<div id="orders" aria-busy="true">
+					<div class="skel skel-row"></div>
+					<div class="skel skel-row"></div>
+				</div>
 			</section>
 
 			<section class="panel">
 				<h2>📦 Inventory</h2>
-				<table class="inv"><tbody id="inv"></tbody></table>
+				<table class="inv"><tbody id="inv" aria-busy="true">
+					<tr><td colspan="3"><div class="skel skel-row" style="height:20px;margin:0;"></div></td></tr>
+					<tr><td colspan="3"><div class="skel skel-row" style="height:20px;margin:0;"></div></td></tr>
+				</tbody></table>
 			</section>
 		</div>
 	</div>
@@ -1736,6 +1811,7 @@ ADMIN_HTML = """<!DOCTYPE html>
 		function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
 		function renderOrders(list) {
 			const root = document.getElementById("orders");
+			root.removeAttribute("aria-busy");
 			const open = list.filter(o => o.status !== "completed" && o.status !== "cancelled");
 			const closed = list.filter(o => o.status === "completed" || o.status === "cancelled");
 			const ordered = [...open.reverse(), ...closed.reverse()];
@@ -1762,6 +1838,7 @@ ADMIN_HTML = """<!DOCTYPE html>
 		}
 		function renderInv(inv) {
 			const tb = document.getElementById("inv");
+			tb.removeAttribute("aria-busy");
 			tb.innerHTML = Object.entries(inv).map(([id, it]) => {
 				const cls = it.stock === 0 ? "zero" : it.stock <= 3 ? "low" : "";
 				return `<tr>
